@@ -5,9 +5,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-# -----------------------
+
 # Helpers
-# -----------------------
 def _read_triples(path: Path) -> List[Tuple[str, str, str]]:
     triples = []
     with open(path, "r", newline="") as f:
