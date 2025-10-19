@@ -1,294 +1,262 @@
+# rgat_lora_memsafe.py
+# LoRA + R-GAT with memory-safe per-relation streaming (Fix 1).
+# Trains on WN18RR, FB15K-237, Cora-KG (TSV triples: head \t rel \t tail)
+# Saves checkpoints + text reports with AUC and Hits@K.
+
+import os
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
-from torch_geometric.utils import add_self_loops
-from pathlib import Path
-import numpy as np
-from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
-from collections import defaultdict
-from datetime import datetime
-from typing import Dict, Any, Optional
+from tqdm import tqdm
 
-_train_path = Path("../WN18RR/train.txt")
-_test_path = Path("../WN18RR/test.txt")
-_valid_path = Path("../WN18RR/valid.txt")
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax
 
-def load_dataset(path: Path) -> list[tuple]:
-    """
-    parses dataset path into list of tuples.
-    """
-    datalist = []
-    with open(path, "r") as f:
+
+# -------------------------
+# Utilities
+# -------------------------
+def load_triples(path: Path) -> List[Tuple[str, str, str]]:
+    triples = []
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            head, relation, tail = line.strip().split("\t")
-            datalist.append((head, relation, tail))
-    return datalist
+            h, r, t = line.rstrip("\n").split("\t")
+            triples.append((h, r, t))
+    return triples
 
-train_list = load_dataset(_train_path)
-valid_list = load_dataset(_valid_path)
-test_list = load_dataset(_test_path)
 
-entities, relations = set(), set()
-for h, r, t in (train_list + valid_list + test_list):
-    entities.add(h); entities.add(t); relations.add(r)
+def build_id_maps(*triple_lists: List[Tuple[str, str, str]]):
+    ents, rels = set(), set()
+    for triples in triple_lists:
+        for h, r, t in triples:
+            ents.add(h); ents.add(t); rels.add(r)
+    ent2id = {e: i for i, e in enumerate(sorted(ents))}
+    rel2id = {r: i for i, r in enumerate(sorted(rels))}
+    return ent2id, rel2id
 
-ent2id = {e: i for i, e in enumerate(sorted(entities))}
-rel2id = {r: i for i, r in enumerate(sorted(relations))}
-num_entities, num_relations = len(ent2id), len(rel2id)
-print(f"#entities={num_entities}, #relations={num_relations}")
 
-def triples_to_tensor(triples):
+def triples_to_tensor(triples, ent2id, rel2id, device):
     arr = np.array([(ent2id[h], rel2id[r], ent2id[t]) for h, r, t in triples], dtype=np.int64)
-    return torch.from_numpy(arr)
+    return torch.from_numpy(arr).to(device)
 
-train_triples = triples_to_tensor(train_list)
-valid_triples = triples_to_tensor(valid_list)
-test_triples = triples_to_tensor(test_list)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-if device.type == 'cuda':
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Memory Available: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-
-train_triples = train_triples.to(device)
-valid_triples = valid_triples.to(device)
-test_triples = test_triples.to(device)
-print(f"Train: {len(train_triples)}, Valid: {len(valid_triples)}, Test: {len(test_triples)} triples")
-
-rel_edge_index = defaultdict(list)
-for h, r, t in train_triples.tolist():
-    rel_edge_index[r].append((h, t))
-    rel_edge_index[r].append((t, h))
-
-for r in range(num_relations):
-    if len(rel_edge_index[r]) == 0:
-        rel_edge_index[r] = torch.empty((2, 0), dtype=torch.long, device=device)
-    else:
-        eidx = torch.tensor(rel_edge_index[r], dtype=torch.long).t().contiguous()
-        eidx, _ = add_self_loops(eidx, num_nodes=num_entities)
-        rel_edge_index[r] = eidx.to(device)
-
-edges_src, edges_dst, edges_type = [], [], []
-for h, r, t in train_triples.tolist():
-    edges_src.extend([h, t])
-    edges_dst.extend([t, h])
-    edges_type.extend([r, r])
-
-edge_index = torch.tensor([edges_src, edges_dst], dtype=torch.long, device=device)
-edge_type = torch.tensor(edges_type, dtype=torch.long, device=device)
-print(f"Unified edge_index shape: {edge_index.shape}, edge_type shape: {edge_type.shape}")
-
-class RelationalGATEncoder(nn.Module):
-    """
-    One GATConv per relation. Messages are summed over relations each layer.
-    """
-    def __init__(self, num_entities, num_relations,
-                 emb_dim=128, hidden_dim=128, out_dim=256,
-                 heads=4, dropout=0.2):
-        super().__init__()
-        self.num_relations = num_relations
-        self.entity_emb = nn.Embedding(num_entities, emb_dim)
-        nn.init.xavier_uniform_(self.entity_emb.weight)
-
-        self.gat1 = nn.ModuleDict({
-            str(r): GATConv(emb_dim, hidden_dim, heads=heads, dropout=dropout)
-            for r in range(num_relations)
-        })
-        self.gat2 = nn.ModuleDict({
-            str(r): GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=dropout)
-            for r in range(num_relations)
-        })
-
-        self.res_proj = nn.Linear(emb_dim, out_dim)
-        self.ln = nn.LayerNorm(out_dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, rel_edge_index: dict[int, torch.Tensor]):
-        x0 = self.entity_emb.weight
-
-        outs = []
-        for r in range(self.num_relations):
-            eidx = rel_edge_index[r]
-            if eidx.numel() == 0:
-                continue
-            outs.append(F.elu(self.gat1[str(r)](x0, eidx)))
-        x = torch.stack(outs).sum(0) if outs else torch.zeros_like(self.res_proj.weight[:x0.size(1)])
-        x = self.drop(x)
-
-        outs = []
-        for r in range(self.num_relations):
-            eidx = rel_edge_index[r]
-            if eidx.numel() == 0:
-                continue
-            outs.append(self.gat2[str(r)](x, eidx))
-        x = torch.stack(outs).sum(0) if outs else torch.zeros_like(self.res_proj(x0))
-
-        x = self.ln(x + self.res_proj(x0))
-        return x
-
-class EmbedRelationGATEncoder(nn.Module):
-    """
-    GAT with relation embeddings: node features are modulated by relation embeddings
-    during message passing (similar to RelationalGIN approach)
-    """
-    def __init__(self, num_entities, num_relations,
-                 emb_dim=128, hidden_dim=128, out_dim=256,
-                 heads=4, dropout=0.2):
-        super().__init__()
-        self.entity_emb = nn.Embedding(num_entities, emb_dim)
-        self.rel_emb = nn.Embedding(num_relations, emb_dim)
-        nn.init.xavier_uniform_(self.entity_emb.weight)
-        nn.init.xavier_uniform_(self.rel_emb.weight)
-        
-        self.gat1 = GATConv(emb_dim, hidden_dim, heads=heads, dropout=dropout)
-        self.gat2 = GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=dropout)
-        
-        self.res_proj = nn.Linear(emb_dim, out_dim)
-        self.ln = nn.LayerNorm(out_dim)
-        self.drop = nn.Dropout(dropout)
-    
-    def forward(self, edge_index, edge_type):
-        """
-        edge_index: [2, E] unified edge index
-        edge_type: [E] relation type per edge
-        """
-        x0 = self.entity_emb.weight
-        
-        rel_weights = self.rel_emb(edge_type)
-        
-        x = self.gat1(x0, edge_index)
-        x = F.elu(x)
-        x = self.drop(x)
-        
-        x = self.gat2(x, edge_index)
-        
-        x = self.ln(x + self.res_proj(x0))
-        return x
-
-class DistMultDecoder(nn.Module):
-    """
-    score(h,r,t) = <e_h, w_r, e_t>
-    """
-    def __init__(self, num_relations, dim):
-        super().__init__()
-        self.rel_emb = nn.Embedding(num_relations, dim)
-        nn.init.xavier_uniform_(self.rel_emb.weight)
-
-    def forward(self, e_h, r, e_t):
-        w_r = self.rel_emb(r)
-        return (e_h * w_r * e_t).sum(dim=1)
-
-class DotProductDecoder(nn.Module):
-    """
-    score(h,r,t) = <e_h, e_t> (relation is ignored)
-    """
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, e_h, r, e_t):
-        return (e_h * e_t).sum(dim=1)
-
-class LinkPredictor(nn.Module):
-    """Flexible link predictor that works with different encoder/decoder combinations"""
-    def __init__(self, encoder, decoder, graph_data):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.graph_data = graph_data
-        
-    def forward(self, triples):
-        h = triples[:, 0]; r = triples[:, 1]; t = triples[:, 2]
-        
-        if isinstance(self.encoder, RelationalGATEncoder):
-            ent = self.encoder(self.graph_data)
-        elif isinstance(self.encoder, EmbedRelationGATEncoder):
-            edge_index, edge_type = self.graph_data
-            ent = self.encoder(edge_index, edge_type)
-        else:
-            raise ValueError(f"Unknown encoder type: {type(self.encoder)}")
-        
-        return self.decoder(ent[h], r, ent[t])
-
-class RelationalGATLinkPredictor(nn.Module):
-    """Legacy wrapper for backward compatibility"""
-    def __init__(self, num_entities, num_relations, rel_edge_index,
-                 out_dim=256, **gat_kwargs):
-        super().__init__()
-        self.encoder = RelationalGATEncoder(num_entities, num_relations,
-                                            out_dim=out_dim, **gat_kwargs)
-        self.decoder = DistMultDecoder(num_relations, out_dim)
-        self.rel_edge_index = rel_edge_index
-
-    def forward(self, triples):
-        h = triples[:, 0]; r = triples[:, 1]; t = triples[:, 2]
-        ent = self.encoder(self.rel_edge_index)
-        return self.decoder(ent[h], r, ent[t])
-
-def batches(tensor, batch_size, shuffle=True):
+def batches(tensor: torch.Tensor, batch_size: int, shuffle: bool = True):
     N = tensor.size(0)
     idx = torch.randperm(N, device=tensor.device) if shuffle else torch.arange(N, device=tensor.device)
     for i in range(0, N, batch_size):
-        yield tensor[idx[i:i+batch_size]]
+        yield tensor[idx[i:i + batch_size]]
+
 
 @torch.no_grad()
-def sample_negatives_both(pos_triples, num_entities, k_neg=10):
-    """
-    Returns flattened head- and tail-corrupted negatives:
-      neg_h: [B*k,3], neg_t: [B*k,3]
-    """
-    B = pos_triples.size(0)
-    device = pos_triples.device
-
-    tails = torch.randint(0, num_entities, (B, k_neg), device=device)
-    neg_t = pos_triples.unsqueeze(1).repeat(1, k_neg, 1)
+def sample_negatives_both(pos_triples: torch.Tensor, num_entities: int, k_neg: int = 10):
+    """Return k_neg head- and tail-corrupted negatives per positive (flattened)."""
+    B = pos_triples.size(0); dev = pos_triples.device
+    # tail corrupt
+    tails = torch.randint(0, num_entities, (B, k_neg), device=dev)
+    neg_t = pos_triples.unsqueeze(1).expand(B, k_neg, 3).clone()
     neg_t[:, :, 2] = tails
-
-    heads = torch.randint(0, num_entities, (B, k_neg), device=device)
-    neg_h = pos_triples.unsqueeze(1).repeat(1, k_neg, 1)
+    # head corrupt
+    heads = torch.randint(0, num_entities, (B, k_neg), device=dev)
+    neg_h = pos_triples.unsqueeze(1).expand(B, k_neg, 3).clone()
     neg_h[:, :, 0] = heads
+    return neg_h.reshape(-1, 3), neg_t.reshape(-1, 3)
 
-    return neg_h.view(-1, 3), neg_t.view(-1, 3)
 
-def train_one_epoch(model, triples, optimizer, batch_size=2048, k_neg=10):
-    model.train()
+def _fmt(x) -> str:
+    try:
+        return f"{float(x):.4f}"
+    except Exception:
+        return "nan"
 
-    pos_weight = torch.tensor([2.0 * k_neg], device=triples.device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    total_loss, total_items = 0.0, 0
-    for pos in batches(triples, batch_size, shuffle=True):
-        neg_h, neg_t = sample_negatives_both(pos, num_entities, k_neg=k_neg)
-        all_trip = torch.cat([pos, neg_h, neg_t], dim=0)
-        labels   = torch.cat([
-            torch.ones(len(pos), device=triples.device),
-            torch.zeros(len(neg_h) + len(neg_t), device=triples.device)
-        ], dim=0)
+# -------------------------
+# Fix 1: Memory-safe LoRA-RGAT convolution (per-relation streaming)
+# -------------------------
+class RelationalLoRAGATConv(MessagePassing):
+    """
+    Memory-safe LoRA + relation-aware GAT.
+    Processes edges **per relation** so we never materialize [E, d*k].
+    LoRA is applied in INPUT space with A_r, B_r shared by all edges of relation r:
+        x_j' = x_j + scale * A_r @ (B_r^T x_j)
+    """
+    def __init__(self, in_dim, out_dim, num_relations,
+                 heads=4, rank=8, adapter_scale=1.0, dropout=0.2,
+                 concat=True, negative_slope=0.2, bias=True):
+        super().__init__(node_dim=0, aggr="add")
+        self.in_dim, self.out_dim = in_dim, out_dim
+        self.heads, self.rank = heads, rank
+        self.adapter_scale = adapter_scale
+        self.concat = concat
+        self.dropout = dropout
 
-        scores = model(all_trip)
-        loss = criterion(scores, labels)
+        # Per-relation LoRA (d x k) each
+        self.A = nn.Embedding(num_relations, in_dim * rank)
+        self.B = nn.Embedding(num_relations, in_dim * rank)
+        nn.init.xavier_uniform_(self.A.weight)
+        nn.init.xavier_uniform_(self.B.weight)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Shared projection
+        self.lin = nn.Linear(in_dim, heads * out_dim, bias=False)
+        nn.init.xavier_uniform_(self.lin.weight)
 
-        total_loss += loss.item() * labels.numel()
-        total_items += labels.numel()
+        # Attention params
+        self.att_l = nn.Parameter(torch.empty(1, heads, out_dim))
+        self.att_r = nn.Parameter(torch.empty(1, heads, out_dim))
+        nn.init.xavier_uniform_(self.att_l); nn.init.xavier_uniform_(self.att_r)
 
-    return total_loss / total_items
+        # Relation bias per head
+        self.rel_head_bias = nn.Embedding(num_relations, heads)
+        nn.init.zeros_(self.rel_head_bias.weight)
 
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+        self.feat_drop = nn.Dropout(dropout)
+        self.att_drop = nn.Dropout(dropout)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(heads * out_dim if concat else out_dim))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x, edge_index, edge_type):
+        """
+        x: [N, d_in], edge_index: [2, E], edge_type: [E]
+        """
+        N, H, C = x.size(0), self.heads, self.out_dim
+
+        # Output accumulator in head space
+        out = x.new_zeros(N, H, C)
+
+        # Process each relation in turn to cap peak memory
+        rel_ids = edge_type.unique()
+
+        for r in rel_ids.tolist():
+            mask = (edge_type == r)
+            if not mask.any():
+                continue
+
+            eidx = edge_index[:, mask]          # [2, E_r]
+            j_idx, i_idx = eidx[0], eidx[1]     # source, target
+
+            # LoRA for this relation (A_r, B_r)
+            A_r = self.A.weight[r].view(self.in_dim, self.rank)    # [d, k]
+            B_r = self.B.weight[r].view(self.in_dim, self.rank)    # [d, k]
+
+            # x_j' = x_j + scale * A_r @ (B_r^T x_j)
+            x_j = x[j_idx]                                        # [E_r, d]
+            BTx = x_j @ B_r                                       # [E_r, k]
+            lora_delta = BTx @ A_r.T                               # [E_r, d]
+            x_j_adapt = x_j + self.adapter_scale * lora_delta      # [E_r, d]
+
+            # Project to head space
+            z_j = self.lin(x_j_adapt).view(-1, H, C)               # [E_r, H, C]
+            z_i = self.lin(x[i_idx]).view(-1, H, C)                # [E_r, H, C]
+
+            # Attention logits + head bias for this relation
+            alpha = (z_i * self.att_l).sum(-1) + (z_j * self.att_r).sum(-1)  # [E_r, H]
+            alpha = alpha + self.rel_head_bias.weight[r].view(1, H)
+            alpha = self.leaky_relu(alpha)
+
+            # Normalize over incoming edges per node, per head
+            alpha = softmax(alpha, i_idx)                          # [E_r, H]
+            alpha = self.att_drop(alpha)
+
+            # Weighted messages
+            m = z_j * alpha.unsqueeze(-1)                          # [E_r, H, C]
+
+            # Aggregate to out
+            out.index_add_(0, i_idx, m)
+
+        if self.concat:
+            out = out.view(N, H * C)
+        else:
+            out = out.mean(dim=1)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+# -------------------------
+# Encoder (2-layer stack)
+# -------------------------
+class LoRARelationalGATEncoder(nn.Module):
+    def __init__(self, num_entities: int, num_relations: int,
+                 emb_dim: int = 128, hidden_dim: int = 128, out_dim: int = 256,
+                 heads: int = 4, rank: int = 8, adapter_scale: float = 1.0, dropout: float = 0.2):
+        super().__init__()
+        self.entity_emb = nn.Embedding(num_entities, emb_dim)
+        nn.init.xavier_uniform_(self.entity_emb.weight)
+
+        self.conv1 = RelationalLoRAGATConv(
+            in_dim=emb_dim, out_dim=hidden_dim, num_relations=num_relations,
+            heads=heads, rank=rank, adapter_scale=adapter_scale, dropout=dropout, concat=True)
+        self.conv2 = RelationalLoRAGATConv(
+            in_dim=hidden_dim * heads, out_dim=out_dim, num_relations=num_relations,
+            heads=1, rank=rank, adapter_scale=adapter_scale, dropout=dropout, concat=False)
+
+        self.res_proj = nn.Linear(emb_dim, out_dim)
+        self.ln = nn.LayerNorm(out_dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, edge_index: torch.Tensor, edge_type: torch.Tensor):
+        x0 = self.entity_emb.weight
+        x = self.conv1(x0, edge_index, edge_type)
+        x = F.elu(x)
+        x = self.drop(x)
+        x = self.conv2(x, edge_index, edge_type)
+        x = self.ln(x + self.res_proj(x0))
+        return x  # [N, out_dim]
+
+
+# -------------------------
+# Decoders
+# -------------------------
+class DistMultDecoder(nn.Module):
+    def __init__(self, num_relations: int, dim: int):
+        super().__init__()
+        self.rel = nn.Embedding(num_relations, dim)
+        nn.init.xavier_uniform_(self.rel.weight)
+
+    def forward(self, e_h: torch.Tensor, r: torch.Tensor, e_t: torch.Tensor):
+        w = self.rel(r)
+        return (e_h * w * e_t).sum(dim=1)
+
+
+class DotProductDecoder(nn.Module):
+    def forward(self, e_h: torch.Tensor, r: torch.Tensor, e_t: torch.Tensor):
+        return (e_h * e_t).sum(dim=1)
+
+
+# -------------------------
+# Link predictor (encoder+decoder)
+# -------------------------
+class LinkPredictor(nn.Module):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module,
+                 edge_index: torch.Tensor, edge_type: torch.Tensor):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.edge_index = edge_index
+        self.edge_type = edge_type
+
+    def forward(self, triples: torch.Tensor):
+        h, r, t = triples[:, 0], triples[:, 1], triples[:, 2]
+        ent = self.encoder(self.edge_index, self.edge_type)
+        return self.decoder(ent[h], r, ent[t])
+
+
+# -------------------------
+# Evaluation
+# -------------------------
 @torch.no_grad()
-def evaluate_auc_hits(model, triples, batch_size=4096, hits_k_list=[1, 5, 10]):
-    """
-    Evaluate AUC and Hits@k for multiple k values.
-    
-    Args:
-        hits_k_list: List of k values for Hits@k metric (default: [1, 5, 10])
-    """
+def evaluate_auc_hits(model: LinkPredictor, triples: torch.Tensor, num_entities: int,
+                      batch_size: int = 4096, ks=(1, 5, 10)) -> Dict[str, float]:
     model.eval()
+
+    # --- AUC (1:1 pos/neg, tail corrupt) ---
     scores_all, labels_all = [], []
     for pos in batches(triples, batch_size, shuffle=False):
         B = pos.size(0)
@@ -298,494 +266,213 @@ def evaluate_auc_hits(model, triples, batch_size=4096, hits_k_list=[1, 5, 10]):
         s_pos = model(pos)
         s_neg = model(neg)
 
-        scores_all.append(torch.cat([s_pos, s_neg], dim=0).cpu().numpy())
+        scores_all.append(torch.cat([s_pos, s_neg], dim=0).detach().cpu().numpy())
         labels_all.append(np.concatenate([np.ones(B), np.zeros(B)], axis=0))
 
-    auc = roc_auc_score(np.concatenate(labels_all), np.concatenate(scores_all))
+    auc = float(roc_auc_score(np.concatenate(labels_all), np.concatenate(scores_all)))
 
-    hits_dict = {k: 0 for k in hits_k_list}
-    trials = 0
-    if isinstance(model, LinkPredictor):
-        if isinstance(model.encoder, RelationalGATEncoder):
-            ent = model.encoder(model.graph_data)
-        elif isinstance(model.encoder, EmbedRelationGATEncoder):
-            edge_index, edge_type = model.graph_data
-            ent = model.encoder(edge_index, edge_type)
-        else:
-            raise ValueError(f"Unknown encoder type: {type(model.encoder)}")
-    elif hasattr(model, 'encoder'):
-        if hasattr(model, 'rel_edge_index'):
-            ent = model.encoder(model.rel_edge_index)
-        else:
-            raise ValueError("Cannot determine how to call encoder")
-    else:
-        raise ValueError("Model has no encoder attribute")
-    
+    # --- Hits@K (tail ranking vs 99 random) ---
+    ent = model.encoder(model.edge_index, model.edge_type)
+    hits = {k: 0 for k in ks}; trials = 0
     for pos in batches(triples, batch_size, shuffle=False):
         B = pos.size(0)
         h = pos[:, 0]; r = pos[:, 1]; t_true = pos[:, 2]
-
         rand_t = torch.randint(0, num_entities, (B, 99), device=pos.device)
-        cand_t = torch.cat([t_true.unsqueeze(1), rand_t], dim=1)
+        cand_t = torch.cat([t_true.view(-1, 1), rand_t], dim=1)
 
-        e_h = ent[h]
-        e_c = ent[cand_t]
-        
+        e_h = ent[h]; e_c = ent[cand_t]  # [B,d], [B,100,d]
         if isinstance(model.decoder, DistMultDecoder):
-            w_r = model.decoder.rel_emb(r)
-            s = ((e_h * w_r).unsqueeze(1) * e_c).sum(dim=2)
-        elif isinstance(model.decoder, DotProductDecoder):
-            s = (e_h.unsqueeze(1) * e_c).sum(dim=2)
+            w = model.decoder.rel(r)
+            s = ((e_h * w).unsqueeze(1) * e_c).sum(dim=2)
         else:
-            raise ValueError(f"Unknown decoder type: {type(model.decoder)}")
-        
+            s = (e_h.unsqueeze(1) * e_c).sum(dim=2)
+
         ranks = (s.argsort(dim=1, descending=True) == 0).nonzero()[:, 1] + 1
-        
-        for k in hits_k_list:
-            hits_dict[k] += (ranks <= k).sum().item()
+        for k in ks:
+            hits[k] += (ranks <= k).sum().item()
         trials += B
 
-    result = {"AUC": float(auc)}
-    for k in hits_k_list:
-        result[f"Hits@{k}"] = hits_dict[k] / trials
-    
-    return result
+    out = {"AUC": auc}
+    for k in ks:
+        out[f"Hits@{k}"] = hits[k] / max(trials, 1)
+    return out
 
-# ============================================================================
-# ABLATION STUDY TRAINING FUNCTION
-# ============================================================================
 
-def train_model(model, train_triples, valid_triples, test_triples,
-                epochs=100, lr=1e-3, weight_decay=1e-4, patience=10,
-                batch_size=2048, k_neg=10, model_name="model"):
-    """
-    Train a model with early stopping and return results dict.
-    Evaluates on test set after training completes.
-    """
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
+# -------------------------
+# Training
+# -------------------------
+def train_epoch(model: LinkPredictor, triples: torch.Tensor,
+                num_entities: int, optimizer: torch.optim.Optimizer,
+                batch_size: int = 2048, k_neg: int = 10) -> float:
+    model.train()
+    pos_weight = torch.tensor([2.0 * k_neg], device=triples.device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    total, count = 0.0, 0
+    for pos in batches(triples, batch_size, shuffle=True):
+        neg_h, neg_t = sample_negatives_both(pos, num_entities, k_neg=k_neg)
+        all_trip = torch.cat([pos, neg_h, neg_t], dim=0)
+        labels = torch.cat([
+            torch.ones(len(pos), device=triples.device),
+            torch.zeros(len(neg_h) + len(neg_t), device=triples.device)
+        ], dim=0)
+
+        optimizer.zero_grad(set_to_none=True)
+        scores = model(all_trip)
+        loss = criterion(scores, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total += float(loss.item()) * labels.numel()
+        count += int(labels.numel())
+    return total / max(count, 1)
+
+
+def train_run(
+        dataset_name: str,
+        train_p: Path, valid_p: Path, test_p: Path,
+        *,
+        outdir: Path = Path("results/rgat-lora"),
+        epochs: int = 100, lr: float = 1e-3, weight_decay: float = 1e-4, patience: int = 10,
+        emb_dim: int = 128, hidden_dim: int = 128, out_dim: int = 256,
+        heads: int = 4, rank: int = 8, adapter_scale: float = 1.0, dropout: float = 0.2,
+        batch_size: int = 2048, k_neg: int = 10,
+        use_distmult: bool = True,
+) -> Dict[str, Any]:
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(outdir / dataset_name, exist_ok=True)
+    print(f"\n=== {dataset_name} | device: {device} ===")
+
+    # --- Load data ---
+    train_list = load_triples(train_p)
+    valid_list = load_triples(valid_p)
+    test_list = load_triples(test_p)
+    ent2id, rel2id = build_id_maps(train_list, valid_list, test_list)
+    num_entities, num_relations = len(ent2id), len(rel2id)
+
+    train = triples_to_tensor(train_list, ent2id, rel2id, device)
+    valid = triples_to_tensor(valid_list, ent2id, rel2id, device)
+    test = triples_to_tensor(test_list, ent2id, rel2id, device)
+
+    # Unified edge_index + types with reverse edges
+    src, dst, typ = [], [], []
+    for h, r, t in train.tolist():
+        src.extend([h, t]); dst.extend([t, h]); typ.extend([r, r])
+    edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
+    edge_type = torch.tensor(typ, dtype=torch.long, device=device)
+
+    # --- Model ---
+    enc = LoRARelationalGATEncoder(
+        num_entities=num_entities, num_relations=num_relations,
+        emb_dim=emb_dim, hidden_dim=hidden_dim, out_dim=out_dim,
+        heads=heads, rank=rank, adapter_scale=adapter_scale, dropout=dropout
+    ).to(device)
+    dec = DistMultDecoder(num_relations, out_dim).to(device) if use_distmult else DotProductDecoder().to(device)
+    model = LinkPredictor(enc, dec, edge_index, edge_type).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
     history = []
     best = {"epoch": 0, "AUC": -1.0, "Hits@1": 0.0, "Hits@5": 0.0, "Hits@10": 0.0}
-    patience_counter = 0
     best_state = None
-    
-    print(f"\n{'='*70}")
-    print(f"Training: {model_name}")
-    print(f"{'='*70}\n")
-    
-    start_time = datetime.now()
-    
-    for epoch in tqdm(range(1, epochs + 1), desc=f"{model_name}"):
-        loss = train_one_epoch(model, train_triples, optimizer, batch_size=batch_size, k_neg=k_neg)
-        metrics = evaluate_auc_hits(model, valid_triples, batch_size=4096, hits_k_list=[1, 5, 10])
-        
+    patience_ctr = 0
+
+    for epoch in tqdm(range(1, epochs + 1), desc=f"{dataset_name}-LoRA-RGAT"):
+        tr_loss = train_epoch(model, train, num_entities, opt, batch_size=batch_size, k_neg=k_neg)
+        val = evaluate_auc_hits(model, valid, num_entities, batch_size=4096)
+
         history.append({
             "epoch": epoch,
-            "train_loss": float(loss),
-            "val_auc": float(metrics["AUC"]),
-            "val_hits1": float(metrics["Hits@1"]),
-            "val_hits5": float(metrics["Hits@5"]),
-            "val_hits10": float(metrics["Hits@10"]),
+            "train_loss": float(tr_loss),
+            "val_auc": float(val["AUC"]),
+            "val_hits1": float(val["Hits@1"]),
+            "val_hits5": float(val["Hits@5"]),
+            "val_hits10": float(val["Hits@10"]),
         })
-        
-        print(f"Epoch {epoch:03d} | loss={loss:.4f} | "
-              f"AUC={metrics['AUC']:.4f} | "
-              f"H@1={metrics['Hits@1']:.4f} | "
-              f"H@5={metrics['Hits@5']:.4f} | "
-              f"H@10={metrics['Hits@10']:.4f}")
-        
-        # Early stopping on AUC
-        if metrics["AUC"] > best["AUC"]:
-            best.update({"epoch": epoch, **metrics})
+        print(f"Epoch {epoch:03d} | loss={tr_loss:.4f} | "
+              f"AUC={val['AUC']:.4f} | H@1={val['Hits@1']:.4f} | H@5={val['Hits@5']:.4f} | H@10={val['Hits@10']:.4f}")
+
+        # Early stop on AUC
+        if val["AUC"] > best["AUC"]:
+            best.update({"epoch": epoch, **val})
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-            print(f"  → New best AUC: {best['AUC']:.4f}")
+            patience_ctr = 0
+            print(f"  → new best AUC: {best['AUC']:.4f}")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch} (patience={patience})")
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                print(f"Early stopping at epoch {epoch} (patience={patience})")
                 break
-    
-    end_time = datetime.now()
-    
-    # Restore best model
+
+    # Restore best & test
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"\nRestored best model from epoch {best['epoch']} | "
-              f"AUC={best['AUC']:.4f} | Hits@10={best['Hits@10']:.4f}")
-    
-    # Evaluate on test set
-    print(f"\n{'='*70}")
-    print(f"FINAL TEST SET EVALUATION")
-    print(f"{'='*70}")
-    test_metrics = evaluate_auc_hits(model, test_triples, batch_size=4096, hits_k_list=[1, 5, 10])
-    print(f"Test AUC:    {test_metrics['AUC']:.4f}")
-    print(f"Test Hits@1: {test_metrics['Hits@1']:.4f}")
-    print(f"Test Hits@5: {test_metrics['Hits@5']:.4f}")
-    print(f"Test Hits@10: {test_metrics['Hits@10']:.4f}")
-    print(f"{'='*70}\n")
-    
-    return {
-        "best": best,
-        "test": test_metrics,
-        "history": history,
-        "epochs_trained": len(history),
-        "start_time": start_time,
-        "end_time": end_time,
-        "model_state": best_state
-    }
+    test_metrics = evaluate_auc_hits(model, test, num_entities, batch_size=4096)
 
-# ============================================================================
-# REPORTING FUNCTIONS
-# ============================================================================
+    # Save checkpoint
+    ckpt_path = outdir / dataset_name / f"lora_rgat_{'distmult' if use_distmult else 'dot'}_d{out_dim}_H{heads}_r{rank}.pt"
+    torch.save({"state_dict": best_state, "best": best, "test": test_metrics,
+                "hparams": {"emb_dim": emb_dim, "hidden_dim": hidden_dim, "out_dim": out_dim,
+                            "heads": heads, "rank": rank, "adapter_scale": adapter_scale,
+                            "dropout": dropout, "decoder": "DistMult" if use_distmult else "Dot"}},
+               ckpt_path)
 
-def _fmt(x):
-    try:
-        return f"{float(x):.4f}"
-    except:
-        return "nan"
-
-def print_comparison_report(title, left_name, left_result, right_name, right_result, save_path=None):
-    """Print and save comparison report for two models."""
+    # Save report
+    rep_path = outdir / dataset_name / f"report_{'distmult' if use_distmult else 'dot'}.txt"
     lines = []
-    lines.append(f"\n{'='*80}")
-    lines.append(f"{title}")
-    lines.append(f"{'='*80}\n")
-    
-    # Best validation metrics summary
-    lines.append("BEST VALIDATION METRICS (used for model selection)")
-    lines.append("-"*80)
-    for name, res in [(left_name, left_result), (right_name, right_result)]:
-        b = res["best"]
-        lines.append(
-            f"{name:30s} | "
-            f"AUC={_fmt(b.get('AUC'))} | "
-            f"H@1={_fmt(b.get('Hits@1'))} | "
-            f"H@5={_fmt(b.get('Hits@5'))} | "
-            f"H@10={_fmt(b.get('Hits@10'))} "
-            f"(epoch {b.get('epoch')})"
-        )
+    lines.append(f"LoRA R-GAT — {dataset_name}")
+    lines.append("=" * 70)
+    lines.append(f"Best (valid) @ epoch {best['epoch']}: "
+                 f"AUC={_fmt(best['AUC'])} | H@1={_fmt(best['Hits@1'])} | H@5={_fmt(best['Hits@5'])} | H@10={_fmt(best['Hits@10'])}")
+    lines.append(f"Test: AUC={_fmt(test_metrics['AUC'])} | H@1={_fmt(test_metrics['Hits@1'])} | "
+                 f"H@5={_fmt(test_metrics['Hits@5'])} | H@10={_fmt(test_metrics['Hits@10'])}")
     lines.append("")
-    
-    # Test metrics summary
-    lines.append("FINAL TEST SET PERFORMANCE (unbiased estimate)")
-    lines.append("-"*80)
-    for name, res in [(left_name, left_result), (right_name, right_result)]:
-        t = res["test"]
-        lines.append(
-            f"{name:30s} | "
-            f"AUC={_fmt(t.get('AUC'))} | "
-            f"H@1={_fmt(t.get('Hits@1'))} | "
-            f"H@5={_fmt(t.get('Hits@5'))} | "
-            f"H@10={_fmt(t.get('Hits@10'))}"
-        )
-    lines.append("")
-    
-    # Detailed histories
-    for name, res in [(left_name, left_result), (right_name, right_result)]:
-        lines.append(f"\n{name} - Training History")
-        lines.append("-"*90)
-        lines.append(f"{'Epoch':<8} {'Train Loss':<14} {'Val AUC':<12} {'H@1':<12} {'H@5':<12} {'H@10':<12}")
-        lines.append("-"*90)
-        for rec in res["history"]:
-            lines.append(
-                f"{rec['epoch']:<8} "
-                f"{_fmt(rec['train_loss']):<14} "
-                f"{_fmt(rec['val_auc']):<12} "
-                f"{_fmt(rec['val_hits1']):<12} "
-                f"{_fmt(rec['val_hits5']):<12} "
-                f"{_fmt(rec['val_hits10']):<12}"
-            )
-        lines.append("")
-    
-    report = "\n".join(lines)
-    print(report)
-    
-    if save_path:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "w") as f:
-            f.write(report)
-        print(f"Report saved to: {save_path}")
+    lines.append("History")
+    lines.append("-" * 70)
+    lines.append(f"{'epoch':<6} {'loss':<10} {'AUC':<10} {'H@1':<10} {'H@5':<10} {'H@10':<10}")
+    for rec in history:
+        lines.append(f"{rec['epoch']:<6} {_fmt(rec['train_loss']):<10} {_fmt(rec['val_auc']):<10} "
+                     f"{_fmt(rec['val_hits1']):<10} {_fmt(rec['val_hits5']):<10} {_fmt(rec['val_hits10']):<10}")
+    with open(rep_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\nSaved checkpoint → {ckpt_path}")
+    print(f"Saved report     → {rep_path}\n")
 
-# ============================================================================
-# ABLATION STUDY CONFIGURATION
-# ============================================================================
+    return {"best": best, "test": test_metrics, "history": history, "ckpt": str(ckpt_path), "report": str(rep_path)}
 
-print("\n" + "="*80)
-print("RGAT ABLATION STUDY CONFIGURATION")
-print("="*80)
-print("""
-Available Ablation Studies:
-1. Decoder Comparison: DistMult vs DotProduct (Attention-per-Relation encoder)
-2. Encoder Comparison: Attention-per-Relation vs Embed-Relation (DistMult decoder)
-3. Combined Variant: Embed-Relation + DotProduct vs Baseline
 
-Configure below by setting flags to True/False
-""")
+# -------------------------
+# Entry for 3 datasets
+# -------------------------
 
-# ============================================================================
-# CONFIGURATION - MODIFY THESE TO RUN DIFFERENT ABLATION STUDIES
-# ============================================================================
+runs = [
+    ("WN18RR",
+     Path("../WN18RR/train.txt"), Path("../WN18RR/valid.txt"), Path("../WN18RR/test.txt")),
+    ("FB15K-237",
+     Path("../FB15K-237/train.txt"), Path("../FB15K-237/valid.txt"), Path("../FB15K-237/test.txt")),
+    ("Cora",
+     Path("data/CORA_KG/train.txt"), Path("data/CORA_KG/valid.txt"), Path("data/CORA_KG/test.txt")),
+]
 
-RUN_DECODER_ABLATION = True
-RUN_ENCODER_ABLATION = True
-RUN_COMBINED_ABLATION = True
+# Global defaults
+HP = dict(
+    epochs=100, lr=1e-3, weight_decay=1e-4, patience=10,
+    emb_dim=128, hidden_dim=128, out_dim=256,
+    heads=4, rank=8, adapter_scale=1.0, dropout=0.2,
+    batch_size=2048, k_neg=10,
+    outdir=Path("results/rgat-lora")
+)
 
-CONFIG = {
-    "emb_dim": 128,
-    "hidden_dim": 128,
-    "out_dim": 256,
-    "heads": 4,
-    "dropout": 0.2,
-    "epochs": 100,
-    "lr": 1e-3,
-    "weight_decay": 1e-4,
-    "patience": 10,
-    "batch_size": 2048,
-    "k_neg": 10,
+PER_DATASET_HP = {
+    "FB15K-237": dict(batch_size=2048, k_neg=10, heads=4, emb_dim=128, hidden_dim=128, out_dim=256, rank=8),
 }
 
-print("\nModel Hyperparameters:")
-for k, v in CONFIG.items():
-    print(f"  {k}: {v}")
-print("")
-
-# ============================================================================
-# ABLATION 1: DECODER COMPARISON (DistMult vs DotProduct)
-# ============================================================================
-
-if RUN_DECODER_ABLATION:
-    print("\n" + "🔬"*40)
-    print("ABLATION STUDY 1: DECODER COMPARISON")
-    print("🔬"*40)
-    print("Comparing: DistMult Decoder vs DotProduct Decoder")
-    print("Encoder: Attention-per-Relation (baseline)")
-    print("")
-    
-    # Model 1: Attention-per-Relation + DistMult
-    enc_distmult = RelationalGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_distmult = DistMultDecoder(num_relations, CONFIG["out_dim"])
-    model_distmult = LinkPredictor(enc_distmult, dec_distmult, rel_edge_index).to(device)
-    
-    res_distmult = train_model(
-        model_distmult, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Attention-per-Relation + DistMult"
-    )
-    
-    # Model 2: Attention-per-Relation + DotProduct
-    enc_dot = RelationalGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_dot = DotProductDecoder()
-    model_dot = LinkPredictor(enc_dot, dec_dot, rel_edge_index).to(device)
-    
-    res_dot = train_model(
-        model_dot, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Attention-per-Relation + DotProduct"
-    )
-    
-    # Print comparison
-    print_comparison_report(
-        title="DECODER ABLATION: DistMult vs DotProduct",
-        left_name="Attention-per-Relation + DistMult",
-        left_result=res_distmult,
-        right_name="Attention-per-Relation + DotProduct",
-        right_result=res_dot,
-        save_path="results/ablation_decoder_comparison.txt"
-    )
-    
-    # Save checkpoints
-    Path("checkpoints").mkdir(exist_ok=True)
-    torch.save({
-        'model_state_dict': res_distmult["model_state"],
-        'config': CONFIG,
-        'results': res_distmult
-    }, "checkpoints/attention_per_rel_distmult.pt")
-    torch.save({
-        'model_state_dict': res_dot["model_state"],
-        'config': CONFIG,
-        'results': res_dot
-    }, "checkpoints/attention_per_rel_dotproduct.pt")
-    print("Decoder ablation checkpoints saved\n")
-
-# ============================================================================
-# ABLATION 2: ENCODER COMPARISON (Attention-per-Relation vs Embed-Relation)
-# ============================================================================
-
-if RUN_ENCODER_ABLATION:
-    print("\n" + "🔬"*40)
-    print("ABLATION STUDY 2: ENCODER COMPARISON")
-    print("🔬"*40)
-    print("Comparing: Attention-per-Relation vs Embed-Relation")
-    print("Decoder: DistMult (baseline)")
-    print("")
-    
-    # Model 1: Attention-per-Relation + DistMult (baseline)
-    enc_attn = RelationalGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_attn = DistMultDecoder(num_relations, CONFIG["out_dim"])
-    model_attn = LinkPredictor(enc_attn, dec_attn, rel_edge_index).to(device)
-    
-    res_attn = train_model(
-        model_attn, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Attention-per-Relation + DistMult"
-    )
-    
-    # Model 2: Embed-Relation + DistMult
-    enc_embed = EmbedRelationGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_embed = DistMultDecoder(num_relations, CONFIG["out_dim"])
-    model_embed = LinkPredictor(enc_embed, dec_embed, (edge_index, edge_type)).to(device)
-    
-    res_embed = train_model(
-        model_embed, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Embed-Relation + DistMult"
-    )
-    
-    # Print comparison
-    print_comparison_report(
-        title="ENCODER ABLATION: Attention-per-Relation vs Embed-Relation",
-        left_name="Attention-per-Relation + DistMult",
-        left_result=res_attn,
-        right_name="Embed-Relation + DistMult",
-        right_result=res_embed,
-        save_path="results/ablation_encoder_comparison.txt"
-    )
-    
-    # Save checkpoints
-    torch.save({
-        'model_state_dict': res_attn["model_state"],
-        'config': CONFIG,
-        'results': res_attn
-    }, "checkpoints/attention_per_rel_distmult.pt")
-    torch.save({
-        'model_state_dict': res_embed["model_state"],
-        'config': CONFIG,
-        'results': res_embed
-    }, "checkpoints/embed_rel_distmult.pt")
-    print("Encoder ablation checkpoints saved\n")
-
-# ============================================================================
-# ABLATION 3: COMBINED VARIANT (Embed-Relation + DotProduct)
-# ============================================================================
-
-if RUN_COMBINED_ABLATION:
-    print("\n" + "🔬"*40)
-    print("ABLATION STUDY 3: COMBINED VARIANT")
-    print("🔬"*40)
-    print("Comparing: Embed-Relation + DotProduct vs Attention-per-Relation + DistMult (baseline)")
-    print("Testing: Does combining both simplifications (encoder + decoder) still work?")
-    print("")
-    
-    # Model 1: Baseline (Attention-per-Relation + DistMult)
-    enc_baseline = RelationalGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_baseline = DistMultDecoder(num_relations, CONFIG["out_dim"])
-    model_baseline = LinkPredictor(enc_baseline, dec_baseline, rel_edge_index).to(device)
-    
-    res_baseline = train_model(
-        model_baseline, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Attention-per-Relation + DistMult (Baseline)"
-    )
-    
-    # Model 2: Combined Variant (Embed-Relation + DotProduct)
-    enc_combined = EmbedRelationGATEncoder(
-        num_entities=num_entities,
-        num_relations=num_relations,
-        emb_dim=CONFIG["emb_dim"],
-        hidden_dim=CONFIG["hidden_dim"],
-        out_dim=CONFIG["out_dim"],
-        heads=CONFIG["heads"],
-        dropout=CONFIG["dropout"]
-    )
-    dec_combined = DotProductDecoder()
-    model_combined = LinkPredictor(enc_combined, dec_combined, (edge_index, edge_type)).to(device)
-    
-    res_combined = train_model(
-        model_combined, train_triples, valid_triples, test_triples,
-        epochs=CONFIG["epochs"], lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"],
-        patience=CONFIG["patience"], batch_size=CONFIG["batch_size"], k_neg=CONFIG["k_neg"],
-        model_name="Embed-Relation + DotProduct (Variant)"
-    )
-    
-    # Print comparison
-    print_comparison_report(
-        title="COMBINED ABLATION: Embed-Relation + DotProduct vs Baseline",
-        left_name="Attention-per-Relation + DistMult (Baseline)",
-        left_result=res_baseline,
-        right_name="Embed-Relation + DotProduct (Variant)",
-        right_result=res_combined,
-        save_path="results/ablation_combined_variant.txt"
-    )
-    
-    # Save checkpoints
-    torch.save({
-        'model_state_dict': res_baseline["model_state"],
-        'config': CONFIG,
-        'results': res_baseline
-    }, "checkpoints/baseline_attn_distmult.pt")
-    torch.save({
-        'model_state_dict': res_combined["model_state"],
-        'config': CONFIG,
-        'results': res_combined
-    }, "checkpoints/combined_embed_dotproduct.pt")
-    print("Combined ablation checkpoints saved\n")
-
-print("\n" + "="*80)
-print("ABLATION STUDY COMPLETE!")
-print("="*80)
-print("\nResults saved to:")
-if RUN_DECODER_ABLATION:
-    print("  - results/ablation_decoder_comparison.txt")
-if RUN_ENCODER_ABLATION:
-    print("  - results/ablation_encoder_comparison.txt")
-if RUN_COMBINED_ABLATION:
-    print("  - results/ablation_combined_variant.txt")
-print("\nCheckpoints saved to checkpoints/ directory")
-print("="*80 + "\n")
+for name, tr, va, te in runs:
+    args = {**HP, **PER_DATASET_HP.get(name, {})}
+    # DistMult (recommended)
+    train_run(name, tr, va, te, use_distmult=True, **args)
+    # Dot product (ablation)
+    if name == "WN18RR":
+        train_run(name, tr, va, te, use_distmult=False, **args)
